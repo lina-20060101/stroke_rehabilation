@@ -1,0 +1,27 @@
+project:
+  seed: 42
+  output_dir: outputs
+
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  manifest: data/manifests/recordings.csv
+  subject_column: subject_id
+  session_column: session_id
+
+prediction:
+  target: fma_ue_after
+  baseline_target: fma_ue_before
+  group_column: subject_id
+  validation: leave_one_subject_out
+
+quality:
+  eeg:
+    line_frequency_hz: 50
+    high_frequency_band_hz: [30, 45]
+  fnirs:
+    motion_derivative_z_threshold: 5.0
+
+fusion:
+  method: quality_gated_late_fusion
+  missing_modality_training: false
