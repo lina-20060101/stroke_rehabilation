@@ -80,7 +80,23 @@ def temporal_quality_objective(
     )
 
     if weights.shape[1] > 1:
-        smoothness_loss = (weights[:, 1:] - weights[:, :-1]).abs().mean()
+        weight_change = (weights[:, 1:] - weights[:, :-1]).abs()
+        availability = outputs.get("available")
+        if availability is None:
+            transition_mask = torch.ones(
+                weights.shape[0], weights.shape[1] - 1,
+                dtype=torch.bool, device=weights.device
+            )
+        else:
+            availability = availability.bool()
+            # 模态可用状态发生变化时，允许门控权重快速切换，不做平滑惩罚。
+            transition_mask = availability[:, 1:].all(dim=-1) & availability[:, :-1].all(dim=-1)
+        if transition_mask.any():
+            smoothness_loss = (
+                weight_change * transition_mask.unsqueeze(-1).to(weight_change.dtype)
+            ).sum() / (transition_mask.sum() * weights.shape[-1]).clamp_min(1)
+        else:
+            smoothness_loss = weights.new_zeros(())
     else:
         smoothness_loss = weights.new_zeros(())
 
