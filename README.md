@@ -1,5 +1,7 @@
 # 卒中康复中的 EEG-fNIRS 时间质量门控
 
+仓库文件地图：[notes/repository_guide.md](notes/repository_guide.md)。
+
 本项目探索：EEG 和 fNIRS 的质量会随时间变化时，模型能否在事件相关时间片上动态调整模态权重，提高卒中康复运动任务识别在信号退化时的稳定性。
 
 ## 当前主模型设想
