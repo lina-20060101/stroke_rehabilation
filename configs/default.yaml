@@ -3,25 +3,73 @@ project:
   output_dir: outputs
 
 data:
-  raw_dir: data/raw
-  processed_dir: data/processed
+  # 修改为解压后的数据目录；原始数据不要放入 Git 仓库。
+  root: /path/to/extracted_dataset
+  processed_dir: /path/to/processed_features
   manifest: data/manifests/recordings.csv
   subject_column: subject_id
   session_column: session_id
+  run_column: run_id
 
-prediction:
-  target: fma_ue_after
-  baseline_target: fma_ue_before
+task:
+  name: temporal_motor_response_detection
+  target: motor_response
+  classes:
+    - no_response
+    - motor_response
+  label_source: target_hand_and_event_markers
+  emg_role: label_validation_only
+
+split:
   group_column: subject_id
-  validation: leave_one_subject_out
+  strategy: leave_one_subject_out
+
+time_alignment:
+  reference: stimulus_event
+  # 在检查预处理脚本和事件标记后确定，单位秒。
+  event_window_seconds: null
+  bin_width_seconds: null
+  preserve_modality_specific_sampling: true
 
 quality:
   eeg:
     line_frequency_hz: 50
     high_frequency_band_hz: [30, 45]
+    local_window: true
   fnirs:
     motion_derivative_z_threshold: 5.0
+    local_window: true
 
-fusion:
-  method: quality_gated_late_fusion
-  missing_modality_training: false
+model:
+  name: TemporalQualityAwareFusion
+  hidden_dim: 32
+  dropout: 0.2
+  time_varying_gate: true
+  uncertainty_weighting: true
+
+loss:
+  branch_weight: 0.25
+  calibration_weight: 0.10
+  smoothness_weight: 0.005
+  corruption_ranking_weight: 0.20
+  corruption_consistency_weight: 0.10
+  # 受控损坏的幅度与持续时间需基于真实数据确定。
+  corruption_profile: pending_data_audit
+
+auxiliary_scale:
+  enabled: false
+  target: fma_ue
+  # 只使用实际测量的 session 标签，不给中间 session 复制分数。
+  masked_to_observed_sessions: true
+
+evaluation:
+  metrics:
+    - balanced_accuracy
+    - macro_f1
+    - auroc
+    - brier_score
+    - expected_calibration_error
+  stress_tests:
+    - local_eeg_corruption
+    - local_fnirs_corruption
+    - missing_modality
