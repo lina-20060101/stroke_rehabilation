@@ -212,17 +212,27 @@ class TemporalQualityAwareFusion(nn.Module):
         temporal_tokens, _ = self.temporal_model(fused_tokens)
         trial_logits = self.trial_head(temporal_tokens[:, -1])
 
-        eeg_trial_logits = eeg_token_logits.mean(dim=1)
-        fnirs_trial_logits = fnirs_token_logits.mean(dim=1)
-
         if available is None:
-            branch_available = torch.ones(
-                eeg_features.shape[0], 2, dtype=torch.bool, device=eeg_features.device
+            availability = torch.ones(
+                eeg_features.shape[0],
+                eeg_features.shape[1],
+                2,
+                dtype=torch.bool,
+                device=eeg_features.device,
             )
         else:
-            branch_available = available.bool().any(dim=1)
+            availability = available.bool()
+
+        eeg_mask = availability[..., 0].to(eeg_token_logits.dtype)
+        fnirs_mask = availability[..., 1].to(fnirs_token_logits.dtype)
+        eeg_trial_logits = (eeg_token_logits * eeg_mask.unsqueeze(-1)).sum(dim=1)
+        eeg_trial_logits = eeg_trial_logits / eeg_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        fnirs_trial_logits = (fnirs_token_logits * fnirs_mask.unsqueeze(-1)).sum(dim=1)
+        fnirs_trial_logits = fnirs_trial_logits / fnirs_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        branch_available = availability.any(dim=1)
 
         return {
+            "available": availability,
             "branch_available": branch_available,
             "trial_logits": trial_logits,
             "weights": weights,  # [B, T, 2]，最后一维顺序 EEG、fNIRS
