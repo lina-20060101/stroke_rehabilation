@@ -215,7 +215,15 @@ class TemporalQualityAwareFusion(nn.Module):
         eeg_trial_logits = eeg_token_logits.mean(dim=1)
         fnirs_trial_logits = fnirs_token_logits.mean(dim=1)
 
+        if available is None:
+            branch_available = torch.ones(
+                eeg_features.shape[0], 2, dtype=torch.bool, device=eeg_features.device
+            )
+        else:
+            branch_available = available.bool().any(dim=1)
+
         return {
+            "branch_available": branch_available,
             "trial_logits": trial_logits,
             "weights": weights,  # [B, T, 2]，最后一维顺序 EEG、fNIRS
             "eeg_trial_logits": eeg_trial_logits,
