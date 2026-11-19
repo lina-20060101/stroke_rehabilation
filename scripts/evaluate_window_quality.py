@@ -7,10 +7,7 @@ from zlib import crc32
 import mne
 import numpy as np
 import pandas as pd
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Ridge
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from stroke_qafusion.recovery_prediction import EndpointRegressor
 
 from prepare_recovery_data import read_clinical, read_manifest
 from stroke_qafusion.window_quality import (
@@ -25,10 +22,12 @@ RUN = ["subject_id", "session_id", "target_hand", "run_id"]
 TRIAL = RUN + ["trial"]
 
 
-def load_windows(manifest, max_session, seed):
+def load_windows(manifest, max_session, seed, subject_ids=None):
     runs = read_manifest(manifest)
     hand = runs.paretic_side.map({"L": "left", "R": "right"})
     early = runs[runs.session_id.le(max_session) & runs.target_hand.eq(hand)]
+    if subject_ids is not None:
+        early = early[early.subject_id.isin(subject_ids)]
     records, audit = [], []
     for run in early.itertuples(index=False):
         key = {name: getattr(run, name) for name in RUN}
@@ -49,13 +48,20 @@ def load_windows(manifest, max_session, seed):
     return pd.DataFrame(records), pd.DataFrame(audit, columns=RUN + ["status", "reason"])
 
 
-def score_fold(windows, held_out):
-    parts = []
-    for modality, block in windows.groupby("modality"):
-        train = block[block.subject_id.ne(held_out) & block.unusable_fraction.lt(1)]
+def fit_rankers(windows):
+    rankers = {}
+    for modality in ("eeg", "fnirs"):
+        train = windows[windows.modality.eq(modality) & windows.unusable_fraction.lt(1)]
         if train.empty:
             raise ValueError(f"训练折缺少可用的 {modality} 时间窗")
-        ranker = WindowQualityRanker().fit(train[QC_COLUMNS], train[DAMAGED_COLUMNS])
+        rankers[modality] = WindowQualityRanker().fit(train[QC_COLUMNS], train[DAMAGED_COLUMNS])
+    return rankers
+
+
+def score_windows(windows, rankers):
+    parts = []
+    for modality, block in windows.groupby("modality"):
+        ranker = rankers[modality]
         parts.append(
             block.assign(
                 score=ranker.score(block[QC_COLUMNS]),
@@ -85,6 +91,10 @@ def score_fold(windows, held_out):
     return response
 
 
+def score_fold(windows, held_out):
+    return score_windows(windows, fit_rankers(windows[windows.subject_id.ne(held_out)]))
+
+
 def patient_features(response, weighting):
     """每个 run 先获得相等的试验总权重，再应用候选质量权重；跨 session 等权。"""
     columns = []
@@ -108,15 +118,8 @@ def patient_features(response, weighting):
 def predict_endpoint(design, clinical, held_out):
     # 预先指定的模型预测变化量，加回已知的入组分数得到末次 FMA-UE。
     train = design.index != held_out
-    model = make_pipeline(
-        SimpleImputer(strategy="median", keep_empty_features=True),
-        StandardScaler(),
-        Ridge(alpha=10),
-    )
-    change = clinical.fma_ue_after - clinical.fma_ue_before
-    model.fit(design.loc[train], change.loc[design.index[train]].astype(float))
-    gain = model.predict(design.loc[[held_out]])[0]
-    return float(np.clip(clinical.at[held_out, "fma_ue_before"] + gain, 0, 66))
+    model = EndpointRegressor().fit(design.loc[train], clinical.fma_ue_after)
+    return float(model.predict(design.loc[[held_out]])[0])
 
 
 def evaluate(windows, clinical):

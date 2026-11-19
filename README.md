@@ -1,6 +1,54 @@
-# 卒中康复中的 EEG-fNIRS 时间质量门控
+# 入组量表与早期 EEG/fNIRS 预测卒中上肢运动结局
 
-仓库文件地图：[notes/repository_guide.md](notes/repository_guide.md)。
+**主结局**为疗程结束时的 FMA-UE 运动评分（0–66 分）。主模型联合入组 FMA-UE、
+入组 ARAT 和截止 session 2 的患手任务 EEG/fNIRS。主比较评估在双量表基础上加入
+脑信号后，留出患者的末次 FMA-UE 平均绝对误差（MAE）改变多少分。
+
+## 完整实验与新患者预测
+
+将官方 FIF 压缩包解压到数据根目录后，在仓库根目录运行：
+
+```powershell
+python -m pip install -e '.[signals,clinical]'
+python scripts/build_manifest.py --data-root D:/Downloads/stroke-dataset-reference/fif-data --output data/processed/recordings.csv
+python scripts/recovery_experiment.py fit --manifest data/processed/recordings.csv --scales D:/Downloads/stroke-dataset-reference/Patients_scales.xlsx --max-session 2 --output-dir outputs/recovery-experiment/session2
+```
+
+每名患者留出一次，同一患者的所有试验和 session 一起留出。所有对照在同一批有双量表、
+末次 FMA-UE 和早期配对信号的患者上评估。每折单独拟合质量判别器、特征插补、标准化及
+岭回归（alpha=10）。主要模型估计相对入组 FMA-UE 的变化，再加回入组分数得到末次预测。
+分析 session 1 时，使用 `--max-session 1` 并指定单独输出目录。
+
+| 比较 | 回答的问题 |
+|---|---|
+| `joint_local` 对 `scales_only` | 已知入组双量表，加入时间窗加权的脑信号能否降低误差？ |
+| `joint_direct` 对 `signals_only` | 同样直接回归末次评分，在脑信号上加入双量表有多少增益？ |
+| `scales_only` 对 `fma_only` | 已知入组 FMA-UE，加入入组 ARAT 有多少增益？ |
+| `scales_eeg`、`scales_fnirs` | 双量表分别加入一种信号时表现如何？ |
+| `joint_local`、`joint_equal`、`joint_run_shared` | 联合模型中局部时间门控有什么作用？ |
+| `carry_forward`、`mean_gain` | 直接结转入组评分，或加上训练患者平均改善，能达到什么误差？ |
+
+运行结果包含队列和 run 审计、逐位留出患者的预测、各模型 MAE、RMSE、偏差及变化量 R²。
+`paired_comparisons.csv` 的 MAE 减少量为正代表该模型误差更低。区间由固定折外预测
+按患者配对重采样得到，描述本队列的个体差异。`protocol.json` 保存运行参数。
+最后在全部合格患者上重拟合联合模型和双量表模型，保存为 `recovery_model.joblib`。
+
+在官方队列的 session 1–2、seed=42 实验中，13 名患者的双量表模型 MAE 为 1.365 分，
+局部门控联合模型为 1.542 分，入组 FMA-UE 加训练患者平均改善为 1.346 分。
+在相同的直接末次评分回归中，从仅脑信号到加入双量表，MAE 从 21.643 降至
+8.560 分。上述结果支持入组量表对末次评分的预测价值。联合模型对个体改善量的
+折外 R² 为 −0.522，加入脑信号对改善幅度的预测价值仍需独立验证。
+
+预测新患者时准备基线 CSV，表头为 `subject_id,fma_ue_before,arat_before`。
+ID 应与该患者早期记录清单一致。下面命令读取本实验生成的模型：
+
+```powershell
+python scripts/recovery_experiment.py predict --model outputs/recovery-experiment/session2/recovery_model.joblib --baselines new_baselines.csv --manifest new_recordings.csv --output-dir outputs/new-predictions
+```
+
+`predictions.csv` 给出双量表预测、联合预测和信号可用状态。预测截止点取自保存的模型。
+仅有入组量表时可省略 `--manifest`，获得双量表预测。新患者评估需要独立队列，
+项目内报告的是原始小样本的留一患者验证。
 
 ## 患者级康复结局数据准备
 
@@ -67,7 +115,7 @@ EEG 分析 0.5–1.5、1.5–2.5 秒的对侧 α/β 功率，fNIRS 分析 4–6�
 
 本项目探索：EEG 和 fNIRS 的质量会随时间变化时，模型能否在事件相关时间片上动态调整模态权重，提高卒中康复运动任务识别在信号退化时的稳定性。
 
-## 当前主模型设想
+### 运动反应识别模型
 
 主任务暂定为 trial 级“运动反应 / 无运动反应”分类。模型接收各自预处理后的 EEG/fNIRS 时间片特征、局部质量指标和相对事件时间；门控逐时间片输出 EEG/fNIRS 权重，再由 GRU 汇总时序并完成分类。
 

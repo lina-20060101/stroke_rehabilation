@@ -11,6 +11,7 @@ from stroke_qafusion.window_quality import DAMAGED_COLUMNS, QC_COLUMNS
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from evaluate_window_quality import patient_features, score_fold  # noqa: E402
+from recovery_experiment import cross_validate  # noqa: E402
 
 
 def example_windows():
@@ -40,6 +41,30 @@ def example_windows():
 
 
 class TestWindowQuality(unittest.TestCase):
+    def test_outcome_is_hidden_and_signal_only_uses_no_scales(self):
+        windows = example_windows()
+        clinical = pd.DataFrame(
+            {
+                "fma_ue_before": [10, 20, 30],
+                "arat_before": [5, 8, 22],
+                "fma_ue_after": [12, 24, 38],
+                "arat_after": [8, 15, 29],
+            },
+            index=["L_01", "R_02", "R_03"],
+        )
+
+        def heldout_scores():
+            predictions = cross_validate(windows, clinical)
+            return predictions[predictions.subject_id.eq("L_01")].set_index("method").predicted
+
+        original = heldout_scores()
+        clinical.loc["L_01", ["fma_ue_after", "arat_after"]] = [50, 40]
+        np.testing.assert_allclose(original, heldout_scores())
+        clinical.loc["L_01", ["fma_ue_before", "arat_before"]] = [40, 30]
+        changed = heldout_scores()
+        self.assertAlmostEqual(original["signals_only"], changed["signals_only"])
+        self.assertNotAlmostEqual(original["joint_local"], changed["joint_local"])
+
     def test_held_out_windows_do_not_train_ranker(self):
         windows = example_windows()
         original = score_fold(windows, "L_01")
