@@ -96,8 +96,8 @@ def eeg_features(raw, triggers, hand):
     return features | {f"qc_eeg_{name}": value for name, value in quality.items()}
 
 
-def fnirs_features(raw, triggers):
-    fs = raw.info["sfreq"]
+def prepare_haemoglobin(raw):
+    """返回可用的长距 HbO、原始光密度和可转换通道比例。"""
     if set(raw.get_channel_types()) != {"fnirs_od"}:
         raise ValueError("fNIRS FIF 的预期通道类型为光密度 fnirs_od")
 
@@ -125,10 +125,20 @@ def fnirs_features(raw, triggers):
     data = data[usable_channels(data)]
     if not len(data):
         raise ValueError("没有可用的 HbO 浓度序列")
-    quality = fnirs_quality_features(data)
-    quality["usable_od_channel_fraction"] = len(picks) / len(optical_density)
+    return data, optical_density, len(picks) / len(optical_density)
+
+
+def filter_hbo(data, fs):
     sos = butter(3, (0.02, 0.1), btype="bandpass", fs=fs, output="sos")
-    filtered = sosfiltfilt(sos, data, axis=-1)
+    return sosfiltfilt(sos, data, axis=-1)
+
+
+def fnirs_features(raw, triggers):
+    fs = raw.info["sfreq"]
+    data, _, usable_fraction = prepare_haemoglobin(raw)
+    quality = fnirs_quality_features(data)
+    quality["usable_od_channel_fraction"] = usable_fraction
+    filtered = filter_hbo(data, fs)
     baseline = samples_in_window(filtered, triggers, fs, -2, 0)
     response = samples_in_window(filtered, triggers, fs, 4, 8)
     change_um = (response.mean(axis=-1) - baseline.mean(axis=-1)) * 1e6

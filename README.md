@@ -32,6 +32,37 @@ fNIRS 光密度经 Beer–Lambert 转换和 0.02–0.1 Hz 滤波后，提取刺�
 等权平均。这些窗口和频带是预先指定的探索性基线。目标刺激表示患手任务指令，
 动作实际执行情况需另用 EMG 核验。训练时按患者划分，标准化、插补和特征选择均在训练折内拟合。
 
+### 时间窗质量判别器与留一患者评估
+
+完成上面的清单步骤后，使用相同环境直接从 FIF 运行：
+
+```powershell
+python scripts/evaluate_window_quality.py --manifest data/processed/recordings.csv --scales D:/Downloads/stroke-dataset-reference/Patients_scales.xlsx --max-session 2 --output-dir outputs/window-quality
+```
+
+EEG 分析 0.5–1.5、1.5–2.5 秒的对侧 α/β 功率，fNIRS 分析 4–6、6–8 秒的 HbO。
+两者各用刺激前 2 秒作基线。判别器读取相应窗的电压或光密度，计算失效通道比例、
+相邻采样点持平比例和异常跳变幅度。突跳大小以同一早期 run 的典型采样差为参照。
+这套处理用于整次记录完成后的分析。
+
+每折用训练患者的原始窗与其加扰副本（削顶、通道失效或阶跃）训练两个独立的
+线性排序器。默认随机种子为 42，可用 `--seed` 指定。模型为质量损失指标拟合非负系数，
+再以 sigmoid 输出相对权重。原始窗没有人工质量标签。每个响应的最终权重取该窗和
+同模态基线窗权重的较小值。`local` 使用局部权重，`run_shared` 对同一 run
+同一模态共享局部权重均值，`equal` 全部等权。三种方案分别汇总相同的六项脑信号特征。
+
+使用同一批患者逐人留出，训练折内插补、标准化并拟合固定的岭回归（alpha=10）。
+回归目标为前后变化量，加回已知基线并限制在 0–66 分得到末次预测。`clinical` 只输入
+基线 FMA-UE，其他三种方案额外输入脑信号特征。
+
+- `endpoint_metrics.csv` 和 `heldout_predictions.csv` 给出四种方法的 MAE 和逐患者预测。
+- `heldout_window_weights.csv` 给出留出患者每个响应窗的分数、基线分数和最终权重，
+  并保存仅基线加扰时的权重。定位实验在每次刺激选一个响应窗加扰，
+  `stress_target` 指示选中的窗，`stress_drop` 是相对原始权重的下降量。
+- `localization_metrics.csv` 按模态、扰动类型汇总选中窗的降权幅度和比例。
+  该实验固定原始 run 的尺度参照，只检验判别器的局部评分。结局 MAE 使用原始记录。
+- `run_audit.csv` 记录候选 run 的处理状态和排除原因。
+
 ## 逐时间片运动反应识别
 
 本项目探索：EEG 和 fNIRS 的质量会随时间变化时，模型能否在事件相关时间片上动态调整模态权重，提高卒中康复运动任务识别在信号退化时的稳定性。
