@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.integrate import trapezoid
 from scipy.signal import welch
 
 from .common import finite_fraction, robust_zscore
@@ -36,11 +37,11 @@ def eeg_quality_features(data: np.ndarray, sfreq: float, line_frequency: float =
     robust_amplitude = np.abs(robust_zscore(clean.reshape(-1)))
     nperseg = min(clean.shape[1], max(8, int(sfreq * 2)))
     freqs, psd = welch(clean, fs=sfreq, nperseg=nperseg, axis=-1)
-    total = np.trapz(psd, freqs, axis=-1)
+    total = trapezoid(psd, freqs, axis=-1)
     hf_mask = (freqs >= 30) & (freqs <= min(45, sfreq / 2 - 1e-6))
     line_mask = np.abs(freqs - line_frequency) <= 1.0
-    hf = np.trapz(psd[:, hf_mask], freqs[hf_mask], axis=-1) if hf_mask.sum() > 1 else np.zeros_like(total)
-    line = np.trapz(psd[:, line_mask], freqs[line_mask], axis=-1) if line_mask.sum() > 1 else np.zeros_like(total)
+    hf = trapezoid(psd[:, hf_mask], freqs[hf_mask], axis=-1) if hf_mask.sum() > 1 else np.zeros_like(total)
+    line = trapezoid(psd[:, line_mask], freqs[line_mask], axis=-1) if line_mask.sum() > 1 else np.zeros_like(total)
 
     ratios_hf = np.divide(hf, total, out=np.zeros_like(hf), where=total > 0)
     ratios_line = np.divide(line, total, out=np.zeros_like(line), where=total > 0)

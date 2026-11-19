@@ -2,6 +2,38 @@
 
 仓库文件地图：[notes/repository_guide.md](notes/repository_guide.md)。
 
+## 患者级康复结局数据准备
+
+目标是用基线 FMA-UE 及早期 EEG/fNIRS 预测疗程结束的 FMA-UE。解压官方
+`EEG_FIF.zip` 和 `FNIRS_FIF.zip` 到同一数据根目录下的两个子目录，并准备官方
+`Patients scales.xlsx`。以下命令从仓库根目录执行：
+
+```powershell
+python -m pip install -e '.[signals,clinical]'
+python scripts/build_manifest.py --data-root D:/Downloads/stroke-dataset-reference/fif-data --output data/processed/recordings.csv
+python scripts/prepare_recovery_data.py --manifest data/processed/recordings.csv --scales D:/Downloads/stroke-dataset-reference/Patients_scales.xlsx --max-session 2 --output-dir data/processed/recovery
+```
+
+将路径替换为实际路径。使用 `--max-session 1` 可生成仅含 session 1 的队列，请给两种
+截止点指定不同的输出目录。截止点按原始 session 编号判定。某患者缺少 session 1 时，
+截止 session 2 的方案允许使用 session 2。量表工作簿提供前后测分数，缺少逐人的量表时间戳，
+所以这里用数据集的疗程序号定义早期窗口。
+
+- `patient_features.csv` 每位符合条件的患者一行，包含基线 FMA-UE、信号及质量特征。
+- `clinical_outcomes.csv` 保留全体患者的原始量表缺失状态、末次 FMA-UE 和前后变化量。
+  监督学习时按 `subject_id` 连接末次 FMA-UE，显式选择输入列。
+- `cohort_audit.csv` 记录队列纳入情况和早期有效记录覆盖。`run_features.csv` 记录患手 run
+  的特征、触发数和排除原因。
+
+处理以两路 FIF 自带的 `flash_l` / `flash_r` 触发为基准，核对触发序列及相对间隔。
+EEG 选取患手对侧的可用感觉运动通道，计算 α/β 频带相对刺激前的对数功率变化。
+fNIRS 光密度经 Beer–Lambert 转换和 0.02–0.1 Hz 滤波后，提取刺激后 4–8 秒相对刺激前
+2 秒的 HbO 变化。`qc_` 列为整段质量代理量。特征在 session 内取中位数、跨 session
+等权平均。这些窗口和频带是预先指定的探索性基线。目标刺激表示患手任务指令，
+动作实际执行情况需另用 EMG 核验。训练时按患者划分，标准化、插补和特征选择均在训练折内拟合。
+
+## 逐时间片运动反应识别
+
 本项目探索：EEG 和 fNIRS 的质量会随时间变化时，模型能否在事件相关时间片上动态调整模态权重，提高卒中康复运动任务识别在信号退化时的稳定性。
 
 ## 当前主模型设想

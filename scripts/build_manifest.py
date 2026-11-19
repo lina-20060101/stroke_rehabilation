@@ -49,14 +49,19 @@ def modality_for(path: Path) -> str | None:
     parent_tokens = {part.lower() for part in path.parts}
     if suffix == ".txt" and "event" in path.name.lower():
         return "event"
-    if suffix == ".snirf" or "fnirs" in parent_tokens:
+    if suffix == ".snirf":
         return "fnirs"
-    if suffix == ".edf" or "eeg" in parent_tokens:
+    if suffix == ".edf":
         return "eeg"
+    if suffix == ".fif":
+        if parent_tokens & {"fnirs", "fnirs_fif"}:
+            return "fnirs"
+        if parent_tokens & {"eeg", "eeg_fif"}:
+            return "eeg"
     return None
 
 
-def choose_preferred(existing: str, candidate: Path, modality: str) -> str:
+def choose_preferred(existing: str, candidate: Path) -> str:
     """当数据包同时提供多种格式时，优先选择 FIF 文件。"""
     if not existing:
         return str(candidate)
@@ -64,6 +69,8 @@ def choose_preferred(existing: str, candidate: Path, modality: str) -> str:
     preferred = ".fif"
     if candidate.suffix.lower() == preferred and current.suffix.lower() != preferred:
         return str(candidate)
+    if candidate.suffix.lower() == current.suffix.lower():
+        raise ValueError(f"同一 run 存在重复文件：{current}；{candidate}")
     return existing
 
 
@@ -71,8 +78,9 @@ def build_manifest(data_root: Path) -> tuple[list[dict[str, str]], list[Path]]:
     rows: dict[RunKey, dict[str, str]] = {}
     unparsed: list[Path] = []
 
+    data_root = data_root.resolve()
     for path in sorted(p for p in data_root.rglob("*") if p.is_file()):
-        modality = modality_for(path)
+        modality = modality_for(Path(data_root.name) / path.relative_to(data_root))
         if modality is None:
             continue
         key = parse_run_key(path)
@@ -93,7 +101,7 @@ def build_manifest(data_root: Path) -> tuple[list[dict[str, str]], list[Path]]:
             },
         )
         column = f"{modality}_path"
-        row[column] = choose_preferred(row[column], path, modality)
+        row[column] = choose_preferred(row[column], path)
 
     return [rows[key] for key in sorted(rows)], unparsed
 
@@ -108,10 +116,12 @@ def main() -> None:
         help="输出 CSV 文件路径",
     )
     args = parser.parse_args()
-    if not args.data_root.exists():
+    if not args.data_root.is_dir():
         raise SystemExit(f"数据目录不存在：{args.data_root}")
 
     rows, unparsed = build_manifest(args.data_root)
+    if not rows:
+        raise SystemExit(f"没有识别到记录。请检查数据是否已解压：{args.data_root}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "subject_id",
