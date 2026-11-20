@@ -1,9 +1,13 @@
 """时间门控回归检查，使用合成的逐窗指标。"""
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -11,7 +15,8 @@ from stroke_qafusion.window_quality import DAMAGED_COLUMNS, QC_COLUMNS
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from evaluate_window_quality import patient_features, score_fold  # noqa: E402
-from recovery_experiment import cross_validate  # noqa: E402
+from recovery_experiment import cross_validate, fit_rankers, make_design, predict, score_windows  # noqa: E402
+from stroke_qafusion.recovery_prediction import JOINT, SCALES, EndpointRegressor  # noqa: E402
 
 
 def example_windows():
@@ -41,6 +46,63 @@ def example_windows():
 
 
 class TestWindowQuality(unittest.TestCase):
+    def test_entire_modality_outage_routes_to_scales_in_validation_and_prediction(self):
+        windows = example_windows()
+        clinical = pd.DataFrame(
+            {
+                "fma_ue_before": [10, 20, 30],
+                "arat_before": [5, 8, 22],
+                "fma_ue_after": [12, 24, 38],
+            },
+            index=pd.Index(["L_01", "R_02", "R_03"], name="subject_id"),
+        )
+        # EEG 基线全部失效，但响应仍有数值；另一患者单个 fNIRS 窗失效。
+        dead = windows.subject_id.eq("L_01") & windows.modality.eq("eeg") & windows.phase.eq(0)
+        partial = windows.subject_id.eq("R_02") & windows.modality.eq("fnirs") & windows.trial.eq(0)
+        windows.loc[dead | partial, QC_COLUMNS] = [1, 1, 0]
+        cv = cross_validate(windows, clinical)
+        routes = cv[cv.method.eq("quality_routed")].set_index("subject_id").prediction_source
+        self.assertEqual(routes.tolist(), ["scales_only", "joint_local", "joint_local"])
+        scores = cv.pivot(index="subject_id", columns="method", values="predicted")
+        for patient, source in routes.items():
+            self.assertEqual(scores.at[patient, source], scores.at[patient, "quality_routed"])
+        rankers = fit_rankers(windows)
+        design = make_design(score_windows(windows, rankers), clinical, "local")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            args = SimpleNamespace(
+                model=root / "fit.joblib",
+                baselines=root / "baseline.csv",
+                manifest=root / "manifest.csv",
+                output_dir=root,
+            )
+            joblib.dump(
+                dict(
+                    version=1,
+                    rankers=rankers,
+                    max_session=2,
+                    seed=42,
+                    joint=EndpointRegressor().fit(design[JOINT], clinical.fma_ue_after),
+                    scales=EndpointRegressor().fit(design[SCALES], clinical.fma_ue_after),
+                ),
+                args.model,
+            )
+            clinical[SCALES].to_csv(args.baselines)
+            with patch("recovery_experiment.load_windows", return_value=(windows, pd.DataFrame())):
+                predict(args)
+            result = pd.read_csv(root / "predictions.csv", index_col="subject_id")
+            self.assertEqual(result.prediction_source.tolist(), routes.tolist())
+            self.assertEqual(result.at["L_01", "joint_status"], "unusable_after_quality_weighting")
+            self.assertTrue(np.isnan(result.at["L_01", "predicted_fma_joint"]))
+            self.assertEqual(
+                result.at["L_01", "predicted_fma"], result.at["L_01", "predicted_fma_scales"]
+            )
+            args.manifest = None
+            predict(args)
+            no_signals = pd.read_csv(root / "predictions.csv")
+            self.assertTrue(no_signals.prediction_source.eq("scales_only").all())
+            np.testing.assert_allclose(no_signals.predicted_fma, no_signals.predicted_fma_scales)
+
     def test_outcome_is_hidden_and_signal_only_uses_no_scales(self):
         windows = example_windows()
         clinical = pd.DataFrame(

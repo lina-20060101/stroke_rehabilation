@@ -26,6 +26,7 @@ python scripts/recovery_experiment.py fit --manifest data/processed/recordings.c
 | `scales_only` 对 `fma_only` | 已知入组 FMA-UE，加入入组 ARAT 有多少增益？ |
 | `scales_eeg`、`scales_fnirs` | 双量表分别加入一种信号时表现如何？ |
 | `joint_local`、`joint_equal`、`joint_run_shared` | 联合模型中局部时间门控有什么作用？ |
+| `quality_routed` 对 `scales_only` | 双模态经局部门控后均有信息时用联合模型，否则回退至双量表，这套规则的误差是多少？ |
 | `carry_forward`、`mean_gain` | 直接结转入组评分，或加上训练患者平均改善，能达到什么误差？ |
 
 运行结果包含队列和 run 审计、逐位留出患者的预测、各模型 MAE、RMSE、偏差及变化量 R²。
@@ -46,7 +47,13 @@ ID 应与该患者早期记录清单一致。下面命令读取本实验生成�
 python scripts/recovery_experiment.py predict --model outputs/recovery-experiment/session2/recovery_model.joblib --baselines new_baselines.csv --manifest new_recordings.csv --output-dir outputs/new-predictions
 ```
 
-`predictions.csv` 给出双量表预测、联合预测和信号可用状态。预测截止点取自保存的模型。
+`predictions.csv` 的 `predicted_fma` 是实际采用的预测，`prediction_source` 记录来源。
+EEG 和 fNIRS 各自至少有一个经局部加权后仍有效的患者级特征时，才提供联合预测。
+个别特征缺失仍可用训练集的中位数填补。整种模态无可用特征时，联合预测留空，
+实际预测取双量表模型；`joint_status` 可区分输入信号缺失与加权后失效。
+这个规则检测完全不可用的模态，质量分数本身只是原始窗与加扰窗的相对排序。
+本队列 13 位留出患者都满足双模态条件，因此本次实验无法估计真实回退患者的误差；
+整种模态失效时的分支由合成输入测试覆盖。预测截止点取自保存的模型。
 仅有入组量表时可省略 `--manifest`，获得双量表预测。新患者评估需要独立队列，
 项目内报告的是原始小样本的留一患者验证。
 
@@ -117,7 +124,7 @@ EEG 分析 0.5–1.5、1.5–2.5 秒的对侧 α/β 功率，fNIRS 分析 4–6�
 
 ### 运动反应识别模型
 
-主任务暂定为 trial 级“运动反应 / 无运动反应”分类。模型接收各自预处理后的 EEG/fNIRS 时间片特征、局部质量指标和相对事件时间；门控逐时间片输出 EEG/fNIRS 权重，再由 GRU 汇总时序并完成分类。
+此处是早期的辅助任务设计，目标为 trial 级“运动反应 / 无运动反应”分类。模型接收各自预处理后的 EEG/fNIRS 时间片特征、局部质量指标和相对事件时间；门控逐时间片输出 EEG/fNIRS 权重，再由 GRU 汇总时序并完成分类。当前患者级末次 FMA-UE 实验使用上文的固定岭回归。
 
 - 模型：`src/stroke_qafusion/models/temporal_quality_fusion.py`
 - 训练损失：`src/stroke_qafusion/models/temporal_losses.py`

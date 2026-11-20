@@ -40,8 +40,14 @@ def signal_coverage(windows, subjects):
 
 
 def make_design(response, scales, weighting):
-    signals = patient_features(response, weighting)
+    signals = patient_features(response, weighting) if not response.empty else pd.DataFrame()
+    signals = signals.reindex(columns=EEG + FNIRS).replace([np.inf, -np.inf], np.nan)
     return scales[SCALES].astype(float).join(signals, validate="one_to_one")
+
+
+def joint_available(design):
+    """每种模态至少有一个经过局部质量加权后仍有效的患者级特征。"""
+    return design[EEG].notna().any(axis=1) & design[FNIRS].notna().any(axis=1)
 
 
 def cross_validate(windows, clinical):
@@ -64,12 +70,15 @@ def cross_validate(windows, clinical):
             model = EndpointRegressor(direct=method == "joint_direct")
             model.fit(design.loc[train_ids], outcome.loc[train_ids])
             estimates[method] = model.predict(design.loc[[held_out]])[0]
+        route = "joint_local" if joint_available(designs["local"]).at[held_out] else "scales_only"
+        estimates["quality_routed"] = estimates[route]
         actual = float(outcome.at[held_out])
         for method, predicted in estimates.items():
             records.append(
                 {
                     "subject_id": held_out,
                     "method": method,
+                    "prediction_source": route if method == "quality_routed" else method,
                     "fma_ue_before": baseline,
                     "actual": actual,
                     "predicted": predicted,
@@ -103,6 +112,7 @@ def summarize(predictions, seed):
     comparisons = []
     pairs = [
         ("joint_local", "scales_only"),
+        ("quality_routed", "scales_only"),
         ("joint_direct", "signals_only"),
         ("scales_only", "fma_only"),
         ("joint_local", "joint_equal"),
@@ -169,6 +179,8 @@ def fit(args):
         "ridge_alpha": 10,
         "clinical_inputs": SCALES,
         "signal_inputs": EEG + FNIRS,
+        "quality_routed": "Use joint_local if each modality has a finite locally weighted "
+        "feature; otherwise use scales_only. Evaluated in the paired-signal primary cohort.",
     }
     (output / "protocol.json").write_text(json.dumps(protocol, indent=2) + "\n", encoding="utf-8")
     joblib.dump(
@@ -226,8 +238,15 @@ def predict(args):
                 windows[windows.subject_id.isin(scales.index[coverage])], bundle["rankers"]
             )
             design = make_design(response, scales.loc[coverage], "local")
-            result.loc[coverage, "predicted_fma_joint"] = bundle["joint"].predict(design)
-            result.loc[coverage, "joint_status"] = "predicted"
+            result.loc[coverage, "joint_status"] = "unusable_after_quality_weighting"
+            usable = design.loc[joint_available(design)]
+            if not usable.empty:
+                result.loc[usable.index, "predicted_fma_joint"] = bundle["joint"].predict(usable)
+                result.loc[usable.index, "joint_status"] = "predicted"
+    result["prediction_source"] = np.where(
+        result.joint_status.eq("predicted"), "joint_local", "scales_only"
+    )
+    result["predicted_fma"] = result.predicted_fma_joint.fillna(result.predicted_fma_scales)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     result.to_csv(args.output_dir / "predictions.csv")
     audit.to_csv(args.output_dir / "inference_run_audit.csv", index=False)
