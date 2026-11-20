@@ -13,16 +13,14 @@ from prepare_recovery_data import read_clinical, read_manifest
 from stroke_qafusion.window_quality import (
     DAMAGED_COLUMNS,
     QC_COLUMNS,
+    RUN,
+    TRIAL,
     WindowQualityRanker,
     extract_quality_windows,
 )
 
 
-RUN = ["subject_id", "session_id", "target_hand", "run_id"]
-TRIAL = RUN + ["trial"]
-
-
-def load_windows(manifest, max_session, seed, subject_ids=None):
+def load_windows(manifest, max_session, seed, subject_ids=None, *, include_waveforms=False):
     runs = read_manifest(manifest)
     hand = runs.paretic_side.map({"L": "left", "R": "right"})
     early = runs[runs.session_id.le(max_session) & runs.target_hand.eq(hand)]
@@ -38,7 +36,10 @@ def load_windows(manifest, max_session, seed, subject_ids=None):
             if not all(p.is_file() and p.suffix.lower() == ".fif" for p in paths):
                 raise ValueError("缺少配对 FIF 文件")
             windows = extract_quality_windows(
-                *paths, run.target_hand, np.random.default_rng(run_seed)
+                *paths,
+                run.target_hand,
+                np.random.default_rng(run_seed),
+                include_waveforms=include_waveforms,
             )
         except (OSError, ValueError, RuntimeError) as exc:
             audit.append(dict(key, status="excluded", reason=str(exc)))

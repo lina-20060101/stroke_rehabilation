@@ -4,7 +4,7 @@ import mne
 import numpy as np
 from scipy.integrate import trapezoid
 from scipy.optimize import minimize
-from scipy.signal import welch
+from scipy.signal import resample_poly, welch
 from scipy.special import expit
 from sklearn.preprocessing import StandardScaler
 
@@ -19,10 +19,13 @@ from .recovery_signals import (
 
 QC_COLUMNS = ["unusable_fraction", "plateau_fraction", "jump_excess"]
 DAMAGED_COLUMNS = [f"damaged_{name}" for name in QC_COLUMNS]
+RUN = ["subject_id", "session_id", "target_hand", "run_id"]
+TRIAL = RUN + ["trial"]
 WINDOWS = {
     "eeg": ((0.5, 1.5), (1.5, 2.5)),
     "fnirs": ((4.0, 6.0), (6.0, 8.0)),
 }
+WAVEFORM_SAMPLES = {"eeg": 128, "fnirs": 28}
 
 
 def step_reference(data):
@@ -132,7 +135,29 @@ def response_features(modality, baseline, response, fs):
     return features
 
 
-def modality_windows(modality, signal, qc_data, triggers, fs, rng):
+def response_waveforms(modality, baseline, response):
+    """按通道减去本 trial 的基线，取通道中位波形，保留各模态独立的时间网格。"""
+    length = WAVEFORM_SAMPLES[modality]
+    waveforms = []
+    for before, after in zip(baseline, response):
+        valid = (
+            np.isfinite(before).all(axis=1)
+            & (np.ptp(before, axis=1) > 0)
+            & np.isfinite(after).all(axis=1)
+            & (np.ptp(after, axis=1) > 0)
+        )
+        if not valid.any():
+            waveforms.append(None)
+            continue
+        corrected = after[valid] - before[valid].mean(axis=1, keepdims=True)
+        wave = np.median(corrected, axis=0)
+        wave = resample_poly(wave, length, len(wave), padtype="line")
+        # 固定物理尺度（µV 或 µM），保留符号与幅度，无需从其他患者估计尺度。
+        waveforms.append(np.arcsinh(wave * 1e6).astype(np.float32))
+    return waveforms
+
+
+def modality_windows(modality, signal, qc_data, triggers, fs, rng, *, include_waveforms=False):
     reference = step_reference(qc_data)
     baseline = samples_in_window(signal, triggers, fs, -2, 0)
     records = []
@@ -142,6 +167,8 @@ def modality_windows(modality, signal, qc_data, triggers, fs, rng):
         if phase:
             response = samples_in_window(signal, triggers, fs, start, end)
             features = response_features(modality, baseline, response, fs)
+            if include_waveforms:
+                features["waveform"] = response_waveforms(modality, baseline, response)
         for trial, block in enumerate(raw_windows):
             kind = rng.choice(["dropout", "clipping", "step"])
             modified = perturb(block, reference, kind, rng)
@@ -161,7 +188,7 @@ def modality_windows(modality, signal, qc_data, triggers, fs, rng):
     return records
 
 
-def extract_quality_windows(eeg_path, fnirs_path, hand, rng):
+def extract_quality_windows(eeg_path, fnirs_path, hand, rng, *, include_waveforms=False):
     eeg = mne.io.read_raw_fif(eeg_path, verbose="ERROR")
     fnirs = mne.io.read_raw_fif(fnirs_path, verbose="ERROR")
     eeg_triggers, fnirs_triggers = paired_target_epochs(eeg, fnirs, hand)
@@ -170,9 +197,27 @@ def extract_quality_windows(eeg_path, fnirs_path, hand, rng):
     if not roi:
         raise ValueError("缺少患手对侧感觉运动区 EEG 通道")
     eeg_data = eeg.get_data(picks=roi)
-    records = modality_windows("eeg", eeg_data, eeg_data, eeg_triggers, eeg.info["sfreq"], rng)
+    records = modality_windows(
+        "eeg",
+        eeg_data,
+        eeg_data,
+        eeg_triggers,
+        eeg.info["sfreq"],
+        rng,
+        include_waveforms=include_waveforms,
+    )
 
     fs = fnirs.info["sfreq"]
     hbo, od, _ = prepare_haemoglobin(fnirs)
-    records.extend(modality_windows("fnirs", filter_hbo(hbo, fs), od, fnirs_triggers, fs, rng))
+    records.extend(
+        modality_windows(
+            "fnirs",
+            filter_hbo(hbo, fs),
+            od,
+            fnirs_triggers,
+            fs,
+            rng,
+            include_waveforms=include_waveforms,
+        )
+    )
     return records

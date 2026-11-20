@@ -1,26 +1,47 @@
 # 入组量表与早期 EEG/fNIRS 预测卒中上肢运动结局
 
-**主结局**为疗程结束时的 FMA-UE 运动评分（0–66 分）。主模型联合入组 FMA-UE、
-入组 ARAT 和截止 session 2 的患手任务 EEG/fNIRS。主比较评估在双量表基础上加入
-脑信号后，留出患者的末次 FMA-UE 平均绝对误差（MAE）改变多少分。
+**主结局**为疗程结束时的 FMA-UE 运动评分（0–66 分）。主模型使用入组 FMA-UE、ARAT
+和康复期间截至第 2 次实验测量的患手任务 EEG/fNIRS。两个一维 CNN 提取局部波形特征，
+时间窗质量判别器参与 Transformer 注意力计算。主比较使用相同留出患者的末次评分
+平均绝对误差（MAE），考察联合模型相对仅用双量表的改善。
 
 ## 完整实验与新患者预测
 
 将官方 FIF 压缩包解压到数据根目录后，在仓库根目录运行：
 
 ```powershell
-python -m pip install -e '.[signals,clinical]'
+python -m pip install -e '.[signals,clinical,train]'
 python scripts/build_manifest.py --data-root D:/Downloads/stroke-dataset-reference/fif-data --output data/processed/recordings.csv
-python scripts/recovery_experiment.py fit --manifest data/processed/recordings.csv --scales D:/Downloads/stroke-dataset-reference/Patients_scales.xlsx --max-session 2 --output-dir outputs/recovery-experiment/session2
+python scripts/recovery_experiment.py fit --architecture cnn-transformer --manifest data/processed/recordings.csv --scales D:/Downloads/stroke-dataset-reference/Patients_scales.xlsx --max-session 2 --output-dir outputs/cnn-transformer/session2
 ```
 
-每名患者留出一次，同一患者的所有试验和 session 一起留出。所有对照在同一批有双量表、
-末次 FMA-UE 和早期配对信号的患者上评估。每折单独拟合质量判别器、特征插补、标准化及
-岭回归（alpha=10）。主要模型估计相对入组 FMA-UE 的变化，再加回入组分数得到末次预测。
-分析 session 1 时，使用 `--max-session 1` 并指定单独输出目录。
+默认的 `fit` 架构是 `cnn-transformer`。`--architecture ridge` 可单独复现原来的岭回归流程。
+分析 session 1 时使用 `--max-session 1`，各次实验分别指定输出目录。
+
+### CNN 局部判断与时间质量注意力
+
+1. 每次患手目标刺激产生四个波形窗。EEG 取提示后 0.5–1.5、1.5–2.5 秒的对侧感觉运动区电压，
+   fNIRS 取 4–6、6–8 秒的长距通道 HbO。各通道减去自身提示前 2 秒的均值，再取有效通道中位波形。
+   每个 EEG 窗重采样至 128 点，每个 HbO 窗至 28 点，分别以 µV 和 µM 作固定的 arcsinh 幅度变换。
+2. 每种模态有独立的一维 CNN。每个窗输出 12 维表示，以及一个只读取本窗波形的任务证据分数
+   `cnn_evidence`。该分数由患者级结局损失学习，取值在 −1 至 1 之间，尚未用动作或伪迹标签校准。
+3. Transformer 接收一个双量表向量和四个带模态、刺激相对时间的窗向量。在每一层、每个头中，
+   对某个窗的注意力得分为 `QK / √d + cnn_evidence + log(q)`，再对所有输入取 softmax。
+   `q` 取同一模态的刺激前质量和响应窗质量中的较小值。它来自训练患者原始窗与加扰窗的排序。
+   `q=0` 或缺失波形对应的注意力为零。量表向量的额外偏置为零。
+4. 每个刺激取经过两层自注意力更新的量表向量，在 run 内等权汇总刺激、在 session 内等权汇总 run，
+   再在患者内等权汇总 session。患者级读出层估计 FMA-UE 改善量，加回入组 FMA-UE 并限定在 0–66 分。
+   一名患者只贡献一次结局损失。
+
+每次留出一名患者及其全部记录。质量判别器、CNN、Transformer、岭回归对照的插补和缩放都在训练折内拟合。
+默认网络宽度 12、2 层、每层 2 个头，CPU 上用 AdamW 固定训练 20 轮。可用 `--epochs` 指定轮数。
+深度模型的三种注意力设置共享队列、初始权重、训练轮数和缺失窗掩码。
 
 | 比较 | 回答的问题 |
 |---|---|
+| `cnn_transformer` 对 `cnn_transformer_no_quality_bias` | 可用窗的质量先验全部设为 1 时，误差如何变化？两者都保留 CNN 局部判断。 |
+| `cnn_transformer` 对 `cnn_transformer_run_shared` | 同一 run 内各模态的总先验权重保持一致，逐窗分配比整段共享有多少增益？ |
+| `cnn_transformer` 对 `quality_routed`、`scales_only`、`mean_gain` | 与原联合岭回归、双量表和训练患者平均改善相比，末次评分误差如何？ |
 | `joint_local` 对 `scales_only` | 已知入组双量表，加入时间窗加权的脑信号能否降低误差？ |
 | `joint_direct` 对 `signals_only` | 同样直接回归末次评分，在脑信号上加入双量表有多少增益？ |
 | `scales_only` 对 `fma_only` | 已知入组 FMA-UE，加入入组 ARAT 有多少增益？ |
@@ -34,23 +55,27 @@ python scripts/recovery_experiment.py fit --manifest data/processed/recordings.c
 按患者配对重采样得到，描述本队列的个体差异。`protocol.json` 保存运行参数。
 最后在全部合格患者上重拟合联合模型和双量表模型，保存为 `recovery_model.joblib`。
 
-在官方队列的 session 1–2、seed=42 实验中，13 名患者的双量表模型 MAE 为 1.365 分，
-局部门控联合模型为 1.542 分，入组 FMA-UE 加训练患者平均改善为 1.346 分。
-在相同的直接末次评分回归中，从仅脑信号到加入双量表，MAE 从 21.643 降至
-8.560 分。上述结果支持入组量表对末次评分的预测价值。联合模型对个体改善量的
-折外 R² 为 −0.522，加入脑信号对改善幅度的预测价值仍需独立验证。
+在官方数据的 session 1–2、seed=42、20 轮实验中，局部质量 CNN＋Transformer 对 13 名患者的
+MAE 为 1.210 分，整段共享质量为 1.212 分，关闭质量先验为 1.241 分。原联合岭回归为 1.542 分，
+双量表岭回归为 1.365 分，入组 FMA-UE 加训练患者平均改善为 1.346 分。新模型相对双量表的 MAE 减少量为 0.155 分
+（患者配对 bootstrap 95% 区间 −0.213 至 0.495），相对整段共享质量的减少量约 0.002 分。
+逐窗质量的独立增益和对新队列的泛化能力仍需验证。
+
+`heldout_attention.csv` 记录主模型每位留出患者、每次刺激、每个窗的质量先验、
+CNN 局部分数及末层量表向量分配给该窗的注意力。四个窗的注意力加上一次
+`clinical_attention` 等于 1。注意力描述模型如何使用输入。
 
 预测新患者时准备基线 CSV，表头为 `subject_id,fma_ue_before,arat_before`。
 ID 应与该患者早期记录清单一致。下面命令读取本实验生成的模型：
 
 ```powershell
-python scripts/recovery_experiment.py predict --model outputs/recovery-experiment/session2/recovery_model.joblib --baselines new_baselines.csv --manifest new_recordings.csv --output-dir outputs/new-predictions
+python scripts/recovery_experiment.py predict --model outputs/cnn-transformer/session2/recovery_model.joblib --baselines new_baselines.csv --manifest new_recordings.csv --output-dir outputs/new-predictions
 ```
 
 `predictions.csv` 的 `predicted_fma` 是实际采用的预测，`prediction_source` 记录来源。
-EEG 和 fNIRS 各自至少有一个经局部加权后仍有效的患者级特征时，才提供联合预测。
-个别特征缺失仍可用训练集的中位数填补。整种模态无可用特征时，联合预测留空，
-实际预测取双量表模型；`joint_status` 可区分输入信号缺失与加权后失效。
+预测命令从模型文件自动选择架构，同时兼容原岭回归模型。CNN 要求两种模态各至少有一个
+质量为正、波形有效的窗。个别缺窗在注意力中屏蔽；整种模态不可用时，实际预测取双量表模型，
+联合预测列留空。`joint_status` 区分配对信号缺失与加权后失效，`inference_attention.csv` 保存 CNN 的逐窗记录。
 这个规则检测完全不可用的模态，质量分数本身只是原始窗与加扰窗的相对排序。
 本队列 13 位留出患者都满足双模态条件，因此本次实验无法估计真实回退患者的误差；
 整种模态失效时的分支由合成输入测试覆盖。预测截止点取自保存的模型。
@@ -124,14 +149,14 @@ EEG 分析 0.5–1.5、1.5–2.5 秒的对侧 α/β 功率，fNIRS 分析 4–6�
 
 ### 运动反应识别模型
 
-此处是早期的辅助任务设计，目标为 trial 级“运动反应 / 无运动反应”分类。模型接收各自预处理后的 EEG/fNIRS 时间片特征、局部质量指标和相对事件时间；门控逐时间片输出 EEG/fNIRS 权重，再由 GRU 汇总时序并完成分类。当前患者级末次 FMA-UE 实验使用上文的固定岭回归。
+此处是早期的辅助任务设计，目标为 trial 级“运动反应 / 无运动反应”分类。模型接收各自预处理后的 EEG/fNIRS 时间片特征、局部质量指标和相对事件时间；门控逐时间片输出 EEG/fNIRS 权重，再由 GRU 汇总时序并完成分类。患者级末次 FMA-UE 实验使用上文的 CNN＋Transformer 和岭回归对照。
 
 - 模型：`src/stroke_qafusion/models/temporal_quality_fusion.py`
 - 训练损失：`src/stroke_qafusion/models/temporal_losses.py`
 - 设计说明与张量接口：`notes/temporal_quality_fusion.md`
 - 已有 EEG/fNIRS 整段质量代理指标：`src/stroke_qafusion/quality/`
 
-新模型接收预计算的特征 token，不直接读 FIF/SNIRF，也尚未包含数据集专用的数据加载和局部特征提取代码。时间片宽度、事件标签生成和质量指标需在检查原始数据后确定。旧的 `quality_aware_temporal.py` 是 FMA 分数回归基线，不包含逐时间片门控。
+这个辅助分类原型接收预计算的特征 token，需要另行提供任务标签和数据加载代码。旧的 `quality_aware_temporal.py` 是早期的 FMA 分数回归原型。当前康复结局网络的实现位于 `src/stroke_qafusion/models/recovery_transformer.py`。
 
 ## 时间对齐原则
 
@@ -148,7 +173,7 @@ FMA/ARAT 主要为康复前后量表，并非每个 trial/session 都有分数�
 
 数据集 DOI：<https://doi.org/10.6084/m9.figshare.28904942>。引用时请同时引用数据论文。原始患者数据不得提交到 Git。
 
-## 训练与验证路线
+## 运动反应分类的训练与验证路线
 
 1. 检查数据文件、预处理示例、刺激事件、目标手信息和 EMG。
 2. 按事件切出 EEG/fNIRS trial，独立预处理并生成共同事件时间网格上的特征与局部质量指标。
@@ -160,7 +185,7 @@ FMA/ARAT 主要为康复前后量表，并非每个 trial/session 都有分数�
 
 ## 环境
 
-Python 3.10 或更高版本。PyTorch 需结合服务器 CUDA 环境安装；当前服务器尚未安装 PyTorch，模型也尚未在真实数据上运行。
+Python 3.10 或更高版本。患者级 CNN＋Transformer 使用 PyTorch 2.2 或更高版本，支持 CPU。
 
 ```bash
 python -m pip install -e '.[signals]'

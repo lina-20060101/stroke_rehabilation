@@ -14,7 +14,7 @@ from prepare_recovery_data import read_clinical
 from stroke_qafusion.recovery_prediction import EEG, FNIRS, JOINT, SCALES, EndpointRegressor
 
 
-# 主模型和对照在运行前固定。各模型共用患者、预测时点和岭惩罚强度。
+# 下列岭回归对照共用患者、预测时点和岭惩罚强度。
 MODELS = {
     "signals_only": ("local", EEG + FNIRS),
     "fma_only": ("local", ["fma_ue_before"]),
@@ -50,7 +50,22 @@ def joint_available(design):
     return design[EEG].notna().any(axis=1) & design[FNIRS].notna().any(axis=1)
 
 
-def cross_validate(windows, clinical):
+def neural_backend():
+    try:
+        import torch
+        from stroke_qafusion import neural_recovery
+    except ModuleNotFoundError as exc:
+        if exc.name != "torch":
+            raise
+        raise SystemExit(
+            "CNN＋Transformer 需要 PyTorch，请运行 python -m pip install -e '.[train]'"
+        ) from exc
+    torch.set_num_threads(min(torch.get_num_threads(), 4))
+    return neural_recovery
+
+
+def cross_validate(windows, clinical, *, cnn_epochs=None, seed=42, attention_frames=None):
+    neural = neural_backend() if cnn_epochs is not None else None
     outcome = clinical.fma_ue_after
     records = []
     for held_out in clinical.index:
@@ -72,13 +87,37 @@ def cross_validate(windows, clinical):
             estimates[method] = model.predict(design.loc[[held_out]])[0]
         route = "joint_local" if joint_available(designs["local"]).at[held_out] else "scales_only"
         estimates["quality_routed"] = estimates[route]
+        sources = {"quality_routed": route}
+        if neural is not None:
+            train = neural.patient_batch(response, clinical.loc[train_ids, SCALES])
+            test = neural.patient_batch(response, clinical.loc[[held_out], SCALES])
+            changes = outcome.loc[train_ids] - clinical.loc[train_ids, "fma_ue_before"]
+            can_predict = train.available.any().item() and test.available.any().item()
+            for method, prior_mode in (
+                ("cnn_transformer", "local"),
+                ("cnn_transformer_no_quality_bias", "none"),
+                ("cnn_transformer_run_shared", "run_shared"),
+            ):
+                if not can_predict:
+                    estimates[method] = estimates["scales_only"]
+                    sources[method] = "scales_only"
+                    continue
+                network = neural.fit_transformer(
+                    train, changes, epochs=cnn_epochs, seed=seed, prior_mode=prior_mode
+                )
+                predicted, attention = neural.predict_transformer(
+                    network, test, prior_mode=prior_mode
+                )
+                estimates[method] = float(predicted.at[held_out])
+                if prior_mode == "local" and attention_frames is not None:
+                    attention_frames.append(attention)
         actual = float(outcome.at[held_out])
         for method, predicted in estimates.items():
             records.append(
                 {
                     "subject_id": held_out,
                     "method": method,
-                    "prediction_source": route if method == "quality_routed" else method,
+                    "prediction_source": sources.get(method, method),
                     "fma_ue_before": baseline,
                     "actual": actual,
                     "predicted": predicted,
@@ -119,6 +158,17 @@ def summarize(predictions, seed):
         ("joint_local", "joint_run_shared"),
         ("joint_local", "mean_gain"),
     ]
+    if "cnn_transformer" in errors:
+        pairs.extend(
+            ("cnn_transformer", ref)
+            for ref in (
+                "cnn_transformer_no_quality_bias",
+                "cnn_transformer_run_shared",
+                "quality_routed",
+                "scales_only",
+                "mean_gain",
+            )
+        )
     for model, reference in pairs:
         gain = (errors[reference] - errors[model]).to_numpy()
         lower, upper = np.quantile(gain[samples].mean(axis=1), [0.025, 0.975])
@@ -137,8 +187,14 @@ def summarize(predictions, seed):
 
 
 def fit(args):
+    use_cnn = args.architecture == "cnn-transformer"
+    neural = neural_backend() if use_cnn else None
+    if use_cnn and args.epochs < 1:
+        raise ValueError("--epochs 至少为 1")
     clinical = read_clinical(args.scales).set_index("subject_id")
-    windows, audit = load_windows(args.manifest, args.max_session, args.seed)
+    windows, audit = load_windows(
+        args.manifest, args.max_session, args.seed, include_waveforms=use_cnn
+    )
     unknown = set(audit.subject_id) - set(clinical.index)
     if unknown:
         raise ValueError(f"记录清单中有量表未收录的患者：{sorted(unknown)}")
@@ -154,13 +210,41 @@ def fit(args):
     if len(clinical) < 3:
         raise ValueError(f"同时具有入组双量表、末次 FMA 和配对信号的患者仅 {len(clinical)} 名")
     windows = windows[windows.subject_id.isin(clinical.index)]
-    predictions = cross_validate(windows, clinical)
+    attention_frames = []
+    predictions = cross_validate(
+        windows,
+        clinical,
+        cnn_epochs=args.epochs if use_cnn else None,
+        seed=args.seed,
+        attention_frames=attention_frames,
+    )
     metrics, comparisons = summarize(predictions, args.seed)
 
     rankers = fit_rankers(windows)
-    design = make_design(score_windows(windows, rankers), clinical, "local")
-    joint = EndpointRegressor().fit(design[JOINT], clinical.fma_ue_after)
-    scale_model = EndpointRegressor().fit(design[SCALES], clinical.fma_ue_after)
+    response = score_windows(windows, rankers)
+    scale_model = EndpointRegressor().fit(clinical[SCALES], clinical.fma_ue_after)
+    bundle = {
+        "version": 2 if use_cnn else 1,
+        "architecture": args.architecture,
+        "rankers": rankers,
+        "scales": scale_model,
+        "max_session": args.max_session,
+        "seed": args.seed,
+    }
+    if use_cnn:
+        batch = neural.patient_batch(response, clinical[SCALES])
+        network = neural.fit_transformer(
+            batch,
+            clinical.fma_ue_after - clinical.fma_ue_before,
+            epochs=args.epochs,
+            seed=args.seed,
+        )
+        bundle["cnn_state"] = {
+            name: tensor.cpu().numpy() for name, tensor in network.state_dict().items()
+        }
+    else:
+        design = make_design(response, clinical, "local")
+        bundle["joint"] = EndpointRegressor().fit(design[JOINT], clinical.fma_ue_after)
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     cohort.to_csv(output / "cohort.csv")
@@ -170,7 +254,7 @@ def fit(args):
     comparisons.to_csv(output / "paired_comparisons.csv", index=False)
     protocol = {
         "endpoint": "fma_ue_after",
-        "primary_model": "joint_local",
+        "primary_model": "cnn_transformer" if use_cnn else "joint_local",
         "primary_reference": "scales_only",
         "metric": "mae",
         "max_session": args.max_session,
@@ -178,22 +262,38 @@ def fit(args):
         "validation": "leave_one_patient_out",
         "ridge_alpha": 10,
         "clinical_inputs": SCALES,
-        "signal_inputs": EEG + FNIRS,
+        "signal_inputs": ["eeg_waveforms", "hbo_waveforms"] if use_cnn else EEG + FNIRS,
         "quality_routed": "Use joint_local if each modality has a finite locally weighted "
         "feature; otherwise use scales_only. Evaluated in the paired-signal primary cohort.",
     }
+    if use_cnn:
+        from stroke_qafusion.models.recovery_transformer import DEPTH, HEADS, WIDTH
+        from stroke_qafusion.window_quality import WINDOWS, WAVEFORM_SAMPLES
+
+        protocol["cnn_transformer"] = {
+            "epochs": args.epochs,
+            "optimizer": "AdamW",
+            "learning_rate": neural.LEARNING_RATE,
+            "weight_decay": neural.WEIGHT_DECAY,
+            "width": WIDTH,
+            "heads": HEADS,
+            "layers": DEPTH,
+            "loss": "patient-level MSE on FMA-UE change",
+            "device": "cpu",
+            "baseline_seconds": [-2, 0],
+            "response_seconds": WINDOWS,
+            "samples_per_window": WAVEFORM_SAMPLES,
+            "attention": "key bias = bounded CNN evidence + log(min(baseline_quality,response_quality)); mask zero and missing waveforms",
+            "fallback": "scales_only if either modality lacks a usable waveform",
+        }
+        attention = (
+            pd.concat(attention_frames, ignore_index=True)
+            if attention_frames
+            else pd.DataFrame(columns=neural.ATTENTION_COLUMNS)
+        )
+        attention.to_csv(output / "heldout_attention.csv", index=False)
     (output / "protocol.json").write_text(json.dumps(protocol, indent=2) + "\n", encoding="utf-8")
-    joblib.dump(
-        {
-            "version": 1,
-            "rankers": rankers,
-            "joint": joint,
-            "scales": scale_model,
-            "max_session": args.max_session,
-            "seed": args.seed,
-        },
-        output / "recovery_model.joblib",
-    )
+    joblib.dump(bundle, output / "recovery_model.joblib")
     print(metrics.to_string(index=False, float_format=lambda n: f"{n:.3f}"))
     print(comparisons.to_string(index=False, float_format=lambda n: f"{n:.3f}"))
     print(f"输出目录 {output.resolve()}")
@@ -219,13 +319,21 @@ def read_baselines(path):
 
 def predict(args):
     bundle = joblib.load(args.model)
-    if bundle["version"] != 1:
+    if bundle["version"] not in (1, 2):
         raise ValueError("不支持该模型文件的版本")
+    use_cnn = bundle["version"] == 2
+    neural = neural_backend() if use_cnn else None
+    if use_cnn:
+        attention = pd.DataFrame(columns=neural.ATTENTION_COLUMNS)
     scales = read_baselines(args.baselines)
     windows, audit = pd.DataFrame(), pd.DataFrame(columns=["subject_id", "status", "reason"])
     if args.manifest is not None:
         windows, audit = load_windows(
-            args.manifest, bundle["max_session"], bundle["seed"], scales.index
+            args.manifest,
+            bundle["max_session"],
+            bundle["seed"],
+            scales.index,
+            include_waveforms=use_cnn,
         )
     result = scales.copy()
     result["predicted_fma_scales"] = bundle["scales"].predict(scales)
@@ -237,19 +345,34 @@ def predict(args):
             response = score_windows(
                 windows[windows.subject_id.isin(scales.index[coverage])], bundle["rankers"]
             )
-            design = make_design(response, scales.loc[coverage], "local")
             result.loc[coverage, "joint_status"] = "unusable_after_quality_weighting"
-            usable = design.loc[joint_available(design)]
-            if not usable.empty:
-                result.loc[usable.index, "predicted_fma_joint"] = bundle["joint"].predict(usable)
-                result.loc[usable.index, "joint_status"] = "predicted"
+            if use_cnn:
+                batch = neural.patient_batch(response, scales.loc[coverage])
+                predicted, attention = neural.predict_transformer(
+                    neural.restore_transformer(bundle["cnn_state"]), batch
+                )
+                predicted = predicted.dropna()
+            else:
+                design = make_design(response, scales.loc[coverage], "local")
+                usable = design.loc[joint_available(design)]
+                predicted = (
+                    pd.Series(bundle["joint"].predict(usable), index=usable.index)
+                    if not usable.empty
+                    else pd.Series(dtype=float)
+                )
+            result.loc[predicted.index, "predicted_fma_joint"] = predicted
+            result.loc[predicted.index, "joint_status"] = "predicted"
     result["prediction_source"] = np.where(
-        result.joint_status.eq("predicted"), "joint_local", "scales_only"
+        result.joint_status.eq("predicted"),
+        "cnn_transformer" if use_cnn else "joint_local",
+        "scales_only",
     )
     result["predicted_fma"] = result.predicted_fma_joint.fillna(result.predicted_fma_scales)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     result.to_csv(args.output_dir / "predictions.csv")
     audit.to_csv(args.output_dir / "inference_run_audit.csv", index=False)
+    if use_cnn:
+        attention.to_csv(args.output_dir / "inference_attention.csv", index=False)
     print(f"量表预测 {len(result)} 人，联合预测 {result.predicted_fma_joint.notna().sum()} 人")
 
 
@@ -260,6 +383,15 @@ def main():
     train.add_argument("--scales", type=Path, required=True)
     train.add_argument("--max-session", type=int, choices=[1, 2], default=2)
     train.add_argument("--seed", type=int, default=42)
+    train.add_argument(
+        "--architecture",
+        choices=["cnn-transformer", "ridge"],
+        default="cnn-transformer",
+        help="默认 CNN＋时间质量注意力；ridge 复现原实验",
+    )
+    train.add_argument(
+        "--epochs", type=int, default=20, help="每折固定训练轮数，仅用于 CNN＋Transformer"
+    )
     infer = commands.add_parser("predict", help="仅用早期记录和入组量表预测")
     infer.add_argument("--model", type=Path, required=True)
     infer.add_argument("--baselines", type=Path, required=True)
